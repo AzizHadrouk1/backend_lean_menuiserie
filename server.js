@@ -15,37 +15,9 @@ app.use(cors({
 app.use(express.json({ limit: '2mb' }));
 
 // ─── CONNEXION MONGODB ───────────────────────────────────────────
-const MONGO_URI = process.env.MONGO_URI;
-
-if (!MONGO_URI) {
-  console.error('❌ FATAL: MONGO_URI manquant dans les variables d\'environnement');
-  process.exit(1);
-}
-
-mongoose.connect(MONGO_URI, {
-  serverSelectionTimeoutMS: 10000,
-  socketTimeoutMS: 45000,
-})
+mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ MongoDB connecté — lean_menuiserie'))
-  .catch(err => {
-    console.error('❌ Erreur MongoDB:', err.message);
-    console.error('   URI utilisée (masquée):', MONGO_URI.replace(/:([^@]+)@/, ':****@'));
-  });
-
-mongoose.connection.on('error', err => console.error('❌ MongoDB runtime error:', err.message));
-mongoose.connection.on('disconnected', () => console.warn('⚠️  MongoDB déconnecté — tentative reconnexion…'));
-mongoose.connection.on('reconnected', () => console.log('✅ MongoDB reconnecté'));
-
-// ─── MIDDLEWARE DB CHECK ─────────────────────────────────────────
-function dbCheck(req, res, next) {
-  if (mongoose.connection.readyState !== 1) {
-    return res.status(503).json({
-      error: 'Base de données non disponible. Réessayez dans quelques secondes.',
-      dbState: mongoose.connection.readyState
-    });
-  }
-  next();
-}
+  .catch(err => console.error('❌ Erreur MongoDB:', err.message));
 
 // ─── MODÈLES ────────────────────────────────────────────────────
 const ResponseSchema = new mongoose.Schema({
@@ -82,93 +54,66 @@ function authMiddleware(req, res, next) {
 
 // ─── ROUTES PUBLIQUES ────────────────────────────────────────────
 
-// Health check — indique l'état réel de la DB
+// Health check
 app.get('/api/health', (req, res) => {
-  const states = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
-  res.json({
-    status: 'ok',
-    db: states[mongoose.connection.readyState] || 'unknown',
-    dbState: mongoose.connection.readyState,
-    env: {
-      hasMongoUri: !!process.env.MONGO_URI,
-      hasJwtSecret: !!process.env.JWT_SECRET,
-      port: process.env.PORT || 5000
-    }
-  });
+  res.json({ status: 'ok', db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' });
 });
 
 // Soumettre une réponse (formulaire public)
-app.post('/api/responses', dbCheck, async (req, res) => {
+app.post('/api/responses', async (req, res) => {
   try {
-    console.log('📥 Nouvelle réponse reçue, body keys:', Object.keys(req.body || {}));
-
     const answers = req.body;
-    if (!answers || typeof answers !== 'object' || Object.keys(answers).length === 0) {
-      return res.status(400).json({ error: 'Corps de la requête vide ou invalide' });
+    if (!answers || Object.keys(answers).length === 0) {
+      return res.status(400).json({ error: 'Réponses vides' });
     }
-
-    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '';
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
     const doc = await Response.create({ answers, ip });
-
-    console.log('✅ Réponse sauvegardée:', doc._id);
     res.status(201).json({ success: true, id: doc._id });
   } catch (err) {
-    console.error('❌ Erreur save response:', err.name, err.message);
-    res.status(500).json({ error: 'Erreur serveur lors de la sauvegarde', detail: err.message });
+    console.error('Erreur save response:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
-// ─── ROUTES ADMIN ────────────────────────────────────────────────
+// ─── ROUTES ADMIN (protégées) ────────────────────────────────────
 
 // Login admin
-app.post('/api/admin/login', dbCheck, async (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
       return res.status(400).json({ error: 'Email et mot de passe requis' });
     }
-
-    if (!process.env.JWT_SECRET) {
-      console.error('❌ JWT_SECRET manquant');
-      return res.status(500).json({ error: 'Configuration serveur incomplète' });
-    }
-
     const admin = await Admin.findOne({ email: email.toLowerCase().trim() });
     if (!admin) {
-      console.warn('⚠️  Tentative login avec email inconnu:', email);
       return res.status(401).json({ error: 'Identifiants incorrects' });
     }
-
     const valid = bcrypt.compareSync(password, admin.password);
     if (!valid) {
-      console.warn('⚠️  Mot de passe incorrect pour:', email);
       return res.status(401).json({ error: 'Identifiants incorrects' });
     }
-
     const token = jwt.sign(
       { email: admin.email, id: admin._id },
       process.env.JWT_SECRET,
       { expiresIn: '8h' }
     );
-
-    console.log('✅ Login admin réussi:', admin.email);
     res.json({ success: true, token, email: admin.email });
   } catch (err) {
-    console.error('❌ Erreur login:', err.message);
-    res.status(500).json({ error: 'Erreur serveur', detail: err.message });
+    console.error('Erreur login:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
-// Vérifier token
+// Vérifier token (pour auto-login)
 app.get('/api/admin/verify', authMiddleware, (req, res) => {
   res.json({ valid: true, email: req.admin.email });
 });
 
-// Lire toutes les réponses (paginées)
-app.get('/api/responses', authMiddleware, dbCheck, async (req, res) => {
+// Lire toutes les réponses
+app.get('/api/responses', authMiddleware, async (req, res) => {
   try {
-    const { page = 1, limit = 20, search = '' } = req.query;
-    const skip = (Number(page) - 1) * Number(limit);
+    const { page = 1, limit = 50, search = '' } = req.query;
+    const skip = (page - 1) * limit;
 
     let query = {};
     if (search) {
@@ -186,81 +131,80 @@ app.get('/api/responses', authMiddleware, dbCheck, async (req, res) => {
       Response.countDocuments(query)
     ]);
 
-    res.json({ data, total, page: Number(page), pages: Math.ceil(total / Number(limit)) });
+    res.json({ data, total, page: Number(page), pages: Math.ceil(total / limit) });
   } catch (err) {
-    console.error('❌ Erreur get responses:', err.message);
-    res.status(500).json({ error: 'Erreur serveur', detail: err.message });
+    console.error('Erreur get responses:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
 // Stats agrégées
-app.get('/api/responses/stats', authMiddleware, dbCheck, async (req, res) => {
+app.get('/api/responses/stats', authMiddleware, async (req, res) => {
   try {
     const total = await Response.countDocuments();
     const all = await Response.find({}, { answers: 1 });
 
-    let sumQ4 = 0, sumQ24 = 0, sumQ33 = 0;
-    let countQ4 = 0, countQ24 = 0, countQ33 = 0;
-    const levierCount = {}, formatsCount = {};
+    let sumQ4 = 0, sumQ24 = 0, sumQ33 = 0, countQ4 = 0, countQ24 = 0, countQ33 = 0;
+    const levierCount = {};
+    const formatsCount = {};
 
     all.forEach(r => {
-      const a = r.answers || {};
-      if (a.Q4  && !isNaN(a.Q4))  { sumQ4  += Number(a.Q4);  countQ4++;  }
-      if (a.Q24 && !isNaN(a.Q24)) { sumQ24 += Number(a.Q24); countQ24++; }
-      if (a.Q33 && !isNaN(a.Q33)) { sumQ33 += Number(a.Q33); countQ33++; }
-      if (a.Q2) levierCount[a.Q2] = (levierCount[a.Q2] || 0) + 1;
+      const a = r.answers;
+      if (a.Q4)  { sumQ4  += Number(a.Q4);  countQ4++;  }
+      if (a.Q24) { sumQ24 += Number(a.Q24); countQ24++; }
+      if (a.Q33) { sumQ33 += Number(a.Q33); countQ33++; }
+      if (a.Q2)  { levierCount[a.Q2] = (levierCount[a.Q2] || 0) + 1; }
       if (Array.isArray(a.Q26)) {
         a.Q26.forEach(f => { formatsCount[f] = (formatsCount[f] || 0) + 1; });
       }
     });
 
-    const topLevier = Object.entries(levierCount).sort((a, b) => b[1] - a[1])[0];
-    const topFormat = Object.entries(formatsCount).sort((a, b) => b[1] - a[1])[0];
+    const topLevier = Object.entries(levierCount).sort((a,b) => b[1]-a[1])[0];
+    const topFormat = Object.entries(formatsCount).sort((a,b) => b[1]-a[1])[0];
 
     res.json({
       total,
       avgSatisfaction: countQ4  ? (sumQ4  / countQ4).toFixed(1)  : null,
       avgConfiance:    countQ24 ? (sumQ24 / countQ24).toFixed(1) : null,
       avgOptimisme:    countQ33 ? (sumQ33 / countQ33).toFixed(1) : null,
-      topLevier:  topLevier ? topLevier[0] : null,
-      topFormat:  topFormat ? topFormat[0] : null,
+      topLevier:  topLevier  ? topLevier[0]  : null,
+      topFormat:  topFormat  ? topFormat[0]  : null,
     });
   } catch (err) {
-    console.error('❌ Erreur stats:', err.message);
-    res.status(500).json({ error: 'Erreur serveur', detail: err.message });
+    res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
 // Supprimer une réponse
-app.delete('/api/responses/:id', authMiddleware, dbCheck, async (req, res) => {
+app.delete('/api/responses/:id', authMiddleware, async (req, res) => {
   try {
-    const result = await Response.findByIdAndDelete(req.params.id);
-    if (!result) return res.status(404).json({ error: 'Réponse introuvable' });
+    await Response.findByIdAndDelete(req.params.id);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: 'Erreur serveur', detail: err.message });
+    res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
 // Supprimer toutes les réponses
-app.delete('/api/responses', authMiddleware, dbCheck, async (req, res) => {
+app.delete('/api/responses', authMiddleware, async (req, res) => {
   try {
     const result = await Response.deleteMany({});
     res.json({ success: true, deleted: result.deletedCount });
   } catch (err) {
-    res.status(500).json({ error: 'Erreur serveur', detail: err.message });
+    res.status(500).json({ error: 'Erreur serveur' });
   }
-});
-
-// ─── 404 ─────────────────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ error: `Route inconnue: ${req.method} ${req.path}` });
 });
 
 // ─── DÉMARRAGE ───────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 API Lean Menuiserie — port ${PORT}`);
-  console.log(`   MONGO_URI défini : ${!!process.env.MONGO_URI}`);
-  console.log(`   JWT_SECRET défini: ${!!process.env.JWT_SECRET}`);
+  console.log(`📋 Routes disponibles:`);
+  console.log(`   GET  /api/health`);
+  console.log(`   POST /api/responses`);
+  console.log(`   POST /api/admin/login`);
+  console.log(`   GET  /api/responses  [protégé]`);
+  console.log(`   GET  /api/responses/stats  [protégé]`);
+  console.log(`   DELETE /api/responses/:id  [protégé]`);
+  console.log(`   DELETE /api/responses  [protégé]`);
 });
